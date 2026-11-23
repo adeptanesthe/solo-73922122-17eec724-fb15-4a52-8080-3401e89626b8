@@ -5,4 +5,7 @@ services:
       - "8000:8000"
     environment:
       SECRET_KEY: "change-me-in-production"
+      # 演示页每次求解的模拟延迟（毫秒），便于在网页上演示
+      # “求解进行中连续改标”的竞态；设为 0 即不延迟。
+      DEMO_SOLVE_DELAY_MS: "1200"
     restart: unless-stopped

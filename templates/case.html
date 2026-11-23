@@ -39,9 +39,17 @@
 <section class="card">
   <h2>4. 求解与推荐</h2>
   <button id="solve-btn" class="primary" type="button">求解灯位</button>
+  <span id="solve-status" class="hint" hidden>正在按最新标记求解…</span>
   <span id="stale-note" class="warn" hidden>
     标记或点对已变更，下方为旧结果——正在重新求解…
   </span>
+  {% if demo and solve_delay_ms %}
+  <p class="hint">
+    演示模式下每次求解会随机延迟约 {{ solve_delay_ms }} 毫秒（带抖动）：
+    可在求解进行中连续取消再恢复同一张原照的“可靠”标记，
+    页面始终只展示最后一次标记对应的结果。
+  </p>
+  {% endif %}
   <div id="result"></div>
 </section>
 {% endif %}
@@ -63,6 +71,8 @@ const state = {
   picking: null,
   lastResult: null,
   solving: false,
+  // 请求序号：只接受最新一次 /solve 的响应，防止迟到的旧响应覆盖新结果。
+  solveSeq: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -101,6 +111,7 @@ async function init() {
     if (!li) return;
     state.pairs.splice(Number(li.dataset.idx), 1);
     renderPairs(); drawMarkers(); markStale();
+    invalidatePendingSolve();  // 在途结果对应旧点对，不得渲染
   });
   $('solve-btn').addEventListener('click', () => solve(true));
 
@@ -136,8 +147,9 @@ async function buildThumbs() {
     const idx = e.target.dataset.img;
     if (idx === undefined) return;
     state.reliable[Number(idx)] = e.target.checked;
-    // 更改可靠标记后重选（自动重新求解）
-    if (state.lastResult) {
+    // 更改可靠标记后自动重新求解。即便上一次求解仍在进行，也要按最新
+    // 标记再发一次；旧响应会被 solveSeq 丢弃，不会覆盖新结果。
+    if (state.pairs.length > 0) {
       markStale();
       solve(false);
     }
@@ -183,6 +195,7 @@ function onCanvasClick(event) {
     state.pairs.push({ line: state.picking.line, base: [x, y] });
     cancelPair();
     renderPairs(); drawMarkers(); markStale();
+    invalidatePendingSolve();  // 在途结果对应旧点对，不得渲染
   }
 }
 
@@ -239,27 +252,35 @@ function markStale() {
 }
 
 async function solve(manual) {
-  if (state.solving) return;
   if (state.pairs.length < 1) {
     if (manual) $('pick-hint').textContent = '请至少点选一对像素';
+    invalidatePendingSolve();
     return;
   }
   if (!state.reliable.some(Boolean)) {
+    invalidatePendingSolve();
+    state.lastResult = null;
     renderError('至少保留一张可靠原照');
     return;
   }
+
+  // 保存本次请求所对应的状态快照；迟到的旧响应一律丢弃。
+  const seq = ++state.solveSeq;
+  const payload = {
+    case_id: CASE_ID,
+    pairs: state.pairs.map(p => [p.line, p.base]),
+    reliable: state.reliable.slice(),
+  };
   state.solving = true;
+  updateSolveStatus();
   try {
     const resp = await fetch('/solve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        case_id: CASE_ID,
-        pairs: state.pairs.map(p => [p.line, p.base]),
-        reliable: state.reliable,
-      }),
+      body: JSON.stringify(payload),
     });
     const body = await resp.json();
+    if (seq !== state.solveSeq) return;  // 已有更新的改标，旧响应作废
     if (!resp.ok || body.error) {
       renderError(body.error || ('求解失败 HTTP ' + resp.status));
       state.lastResult = null;
@@ -269,13 +290,32 @@ async function solve(manual) {
     $('stale-note').hidden = true;
     renderResult(body.result);
   } catch (err) {
+    if (seq !== state.solveSeq) return;
     renderError('网络错误: ' + err);
+    state.lastResult = null;
   } finally {
-    state.solving = false;
+    if (seq === state.solveSeq) {
+      state.solving = false;
+      updateSolveStatus();
+    }
   }
 }
 
+function invalidatePendingSolve() {
+  // 让仍在途中的 /solve 响应作废，避免它覆盖当前（更新或不合法）的状态。
+  state.solveSeq += 1;
+  if (state.solving) {
+    state.solving = false;
+    updateSolveStatus();
+  }
+}
+
+function updateSolveStatus() {
+  $('solve-status').hidden = !state.solving;
+}
+
 function renderError(msg) {
+  $('stale-note').hidden = true;
   $('result').innerHTML =
     `<div class="banner error-banner"><strong>错误：</strong>${escapeHtml(msg)}</div>`;
 }

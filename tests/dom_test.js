@@ -186,8 +186,201 @@ async function run() {
   check(w4.document.getElementById('start-pair').hidden === false,
         '成对点选完成后恢复添加按钮');
 
+  // ---- 场景五：求解进行中连续改标，迟到旧响应不得覆盖最新结果 ----
+  await raceScenario();
+
   console.log(asserts.join('\n'));
   console.log('\nDOM 交互自测全部通过。');
+}
+
+// 可控延迟响应：记录每次 /solve 请求，测试按需决定响应内容与到达顺序。
+function makeDeferredDom() {
+  const calls = [];
+  const { dom } = makeDom((url, opts) => {
+    if (url.includes('/image/')) {
+      const idx = Number(url.split('/image/')[1]);
+      return Promise.resolve(jsonResponse({}, idx < 4 ? 200 : 404));
+    }
+    const call = { body: JSON.parse(opts.body) };
+    call.response = new Promise(
+      resolve => { call.resolve = (body, status = 200) =>
+        resolve(jsonResponse(body, status)); });
+    calls.push(call);
+    return call.response;
+  });
+  return { dom, calls };
+}
+
+async function raceScenario() {
+  const infeasible = {
+    ok: true,
+    result: {
+      infeasible: true, feasible_exclusions: [],
+      recommendation: null, guarantee: null,
+      verdicts: [0, 1, 2, 3].map(i => ({
+        index: i, vector: [0, 0, 0], qualified: false, guarantee: null,
+        global_min: null, global_max: null,
+        fail_reason: '原照无共同解释，无法评估',
+      })),
+    },
+  };
+  const noLight = {
+    ok: true,
+    result: {
+      infeasible: false, feasible_exclusions: ['排除第 1 张原照'],
+      recommendation: null, guarantee: null,
+      verdicts: [0, 1, 2, 3].map(i => ({
+        index: i, vector: [5, 0, 3], qualified: false, guarantee: null,
+        global_min: null, global_max: null,
+        fail_reason: '像素(0,0) 预测灰度可达 255.9 ~ 330.6，超出 [5, 250]',
+      })),
+    },
+  };
+  const lastOk = {
+    ok: true,
+    result: {
+      infeasible: false,
+      feasible_exclusions: ['不排除', '排除第 1 张原照'],
+      recommendation: 3, guarantee: 32.3,
+      verdicts: [0, 1, 2, 3].map(i => ({
+        index: i, vector: [0.1, 0.1, 0.8], qualified: i === 3,
+        guarantee: i === 3 ? 32.3 : -1,
+        global_min: 154, global_max: 194, fail_reason: null,
+      })),
+    },
+  };
+
+  // 场景 5a：取消 → 恢复可靠标记；最新响应先到，两个旧响应后到。
+  {
+    const { dom, calls } = makeDeferredDom();
+    const w = dom.window;
+    const doc = w.document;
+    await tick();
+    check(calls.length === 1, '竞态演示：页面加载后自动求解一次');
+
+    const checkbox = doc.querySelector('input[data-img="0"]');
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new w.Event('change', { bubbles: true }));
+    await tick(5);
+    check(calls.length === 2 && calls[1].body.reliable[0] === false,
+          '求解进行中取消可靠标记仍会发起新求解');
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new w.Event('change', { bubbles: true }));
+    await tick(5);
+    check(calls.length === 3 && calls[2].body.reliable[0] === true,
+          '连续恢复同一原照会再发起一次求解（最终标记为可靠）');
+    check(!doc.getElementById('solve-status').hidden,
+          '求解进行中显示“正在按最新标记求解…”');
+
+    // 最新请求先返回，旧请求按相反顺序迟到
+    calls[2].resolve(lastOk);
+    await tick();
+    calls[1].resolve(infeasible);
+    await tick();
+    calls[0].resolve(okResult);
+    await tick();
+
+    const txt = doc.getElementById('result').textContent;
+    check(txt.includes('推荐：第 4 盏') && txt.includes('32.3'),
+          '最终只展示最后一次标记对应的可行解释、合格灯与推荐');
+    check(txt.includes('排除第 1 张原照'),
+          '最终展示最后一次标记下的可行解释');
+    check(!txt.includes('推荐：第 1 盏') && !txt.includes('无共同解释'),
+          '迟到的旧响应不能覆盖新结果');
+    check(doc.querySelectorAll('.rec-row').length === 1
+          && doc.querySelector('.rec-row').textContent.includes('4 ★'),
+          '推荐行唯一且属于最新结果');
+    check(doc.getElementById('solve-status').hidden,
+          '最新结果渲染后隐藏求解中提示');
+
+    // 仍允许继续改标：再来一次并立即返回
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new w.Event('change', { bubbles: true }));
+    await tick(5);
+    check(calls.length === 4 && calls[3].body.reliable[0] === false,
+          '竞态结束后仍可继续改标并求解');
+    calls[3].resolve(infeasible);
+    await tick();
+    check(doc.getElementById('result').textContent.includes('原照无共同解释'),
+          '继续改标后的结果正常渲染');
+  }
+
+  // 场景 5b：最后状态无共同解释 → 迟到的旧推荐必须被撤下。
+  {
+    const { dom, calls } = makeDeferredDom();
+    const w = dom.window;
+    const doc = w.document;
+    await tick();
+    const checkbox = doc.querySelector('input[data-img="0"]');
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new w.Event('change', { bubbles: true }));
+    await tick(5);
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new w.Event('change', { bubbles: true }));
+    await tick(5);
+
+    calls[1].resolve(lastOk);      // 中间状态先到（还会被丢弃）
+    await tick();
+    calls[2].resolve(infeasible);  // 最后状态
+    await tick();
+    calls[0].resolve(okResult);    // 最早的旧推荐最后迟到
+    await tick();
+
+    const txt = doc.getElementById('result').textContent;
+    check(txt.includes('原照无共同解释'), '最后状态无共同解释时显示对应提示');
+    check(!txt.includes('推荐：第') && !txt.includes('32.3')
+          && !txt.includes('50.04'),
+          '最后状态无共同解释时撤下旧推荐');
+  }
+
+  // 场景 5c：最后状态无灯可用 → 同样撤下旧推荐。
+  {
+    const { dom, calls } = makeDeferredDom();
+    const w = dom.window;
+    const doc = w.document;
+    await tick();
+    const checkbox = doc.querySelector('input[data-img="0"]');
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new w.Event('change', { bubbles: true }));
+    await tick(5);
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new w.Event('change', { bubbles: true }));
+    await tick(5);
+
+    calls[2].resolve(noLight);
+    await tick();
+    calls[0].resolve(okResult);
+    await tick();
+    calls[1].resolve(lastOk);
+    await tick();
+
+    const txt = doc.getElementById('result').textContent;
+    check(txt.includes('无灯可用'), '最后状态无灯可用时显示对应提示');
+    check(!txt.includes('推荐：第'),
+          '最后状态无灯可用时撤下旧推荐');
+  }
+
+  // 场景 5d：求解进行中把全部原照都取消可靠 → 立刻提示，旧响应被丢弃。
+  {
+    const { dom, calls } = makeDeferredDom();
+    const w = dom.window;
+    const doc = w.document;
+    await tick();
+    const boxes = [...doc.querySelectorAll('input[data-img]')];
+    boxes.forEach((cb) => {
+      cb.checked = false;
+      cb.dispatchEvent(new w.Event('change', { bubbles: true }));
+    });
+    await tick(5);
+    const txt = doc.getElementById('result').textContent;
+    check(txt.includes('至少保留一张可靠原照'),
+          '全部不可靠时立即提示，不等待在途响应');
+    check(!txt.includes('推荐：第'), '全部不可靠时撤下旧推荐');
+    calls.forEach(call => call.resolve(okResult));
+    await tick();
+    check(!doc.getElementById('result').textContent.includes('推荐：第'),
+          '在途旧响应全部到达后仍不显示推荐');
+  }
 }
 
 run().catch(err => { console.error(err); process.exit(1); });

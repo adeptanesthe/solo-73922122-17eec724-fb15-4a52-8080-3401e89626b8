@@ -13,6 +13,7 @@ import io
 import json
 import math
 import os
+import random
 import time
 import uuid
 
@@ -29,6 +30,9 @@ app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
 # 单用户工具：案例保存在进程内存中，键为随机案例 id。
 CASES: dict = {}
+
+# 演示延迟的抖动范围（相对基准值）：各请求延迟不同，便于观察乱序响应。
+DEMO_DELAY_JITTER = (0.6, 1.4)
 
 MIN_IMAGES, MAX_IMAGES = 4, 8
 MIN_CANDIDATES, MAX_CANDIDATES = 2, 8
@@ -202,7 +206,8 @@ def demo():
     }
     session["case_id"] = case_id
     return render_template("case.html", case_id=case_id,
-                           demo=meta, max_pairs=MAX_PAIRS)
+                           demo=meta, max_pairs=MAX_PAIRS,
+                           solve_delay_ms=int(_demo_solve_delay_seconds() * 1000))
 
 
 @app.route("/case/<case_id>/image/<int:index>")
@@ -217,9 +222,10 @@ def case_image(case_id, index):
 def case_view(case_id):
     case = CASES.get(case_id)
     if case is None:
-        return render_template("case.html", case_id=None), 404
+        return render_template("case.html", case_id=None,
+                               solve_delay_ms=0), 404
     return render_template("case.html", case_id=case_id, demo=None,
-                           max_pairs=MAX_PAIRS)
+                           max_pairs=MAX_PAIRS, solve_delay_ms=0)
 
 
 @app.route("/solve", methods=["POST"])
@@ -243,6 +249,14 @@ def solve():
     if not any(reliable):
         raise ValidationError("至少保留一张可靠原照")
 
+    # 仅演示案例可选地延迟响应，便于在网页上演示“求解进行中连续改标”
+    # 的竞态。默认 0（不延迟），不影响真实案例与接口格式。每次请求的
+    # 延迟带随机抖动，使先发的请求可能后到，从而真实检验前端丢弃旧响应。
+    if case.get("demo_meta"):
+        delay = _demo_solve_delay_seconds()
+        if delay:
+            time.sleep(delay * random.uniform(*DEMO_DELAY_JITTER))
+
     scene = Scene(
         images=case["images"],
         lights=case["lights"],
@@ -260,6 +274,18 @@ def solve():
                            "result": result}
 
     return jsonify({"ok": True, "result": _serialize_result(result, case)})
+
+
+def _demo_solve_delay_seconds() -> float:
+    """演示用求解延迟（秒），由 DEMO_SOLVE_DELAY_MS 控制，非法值视为 0。"""
+    raw = os.environ.get("DEMO_SOLVE_DELAY_MS", "0")
+    try:
+        ms = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(ms) or ms <= 0:
+        return 0.0
+    return ms / 1000.0
 
 
 def _int_field(raw, label):

@@ -3,6 +3,7 @@ import io
 import json
 import os
 import sys
+import time
 
 import numpy as np
 from PIL import Image
@@ -197,6 +198,40 @@ def test_no_usable_light(client):
         "所有灯不合格 → 无灯可用且推荐撤下")
 
 
+def test_demo_delay_is_opt_in_and_demo_only(client):
+    print("test_demo_delay_is_opt_in_and_demo_only")
+    old = os.environ.get("DEMO_SOLVE_DELAY_MS")
+    try:
+        # 非演示案例：即使设置了延迟环境变量也不会被拖慢。
+        images, meta = base_tiles()
+        resp = make_upload(client, images, meta["lights"], meta["candidates"])
+        cid = resp.get_json()["case_id"]
+        payload = {"case_id": cid, "pairs": meta["suggested_pairs"],
+                   "reliable": [True] * 4}
+        start = time.monotonic()
+        client.post("/solve", json=payload)
+        baseline = time.monotonic() - start
+        os.environ["DEMO_SOLVE_DELAY_MS"] = "1500"
+        start = time.monotonic()
+        resp = client.post("/solve", json=payload)
+        extra = time.monotonic() - start - baseline
+        check(resp.get_json()["ok"] and extra < 0.8,
+              f"上传案例不受演示延迟影响（额外 {extra:.3f}s）")
+
+        # 演示页渲染延迟提示；延迟值非法时按 0 处理。
+        os.environ["DEMO_SOLVE_DELAY_MS"] = "1200"
+        html = client.get("/demo").get_data(as_text=True)
+        check("1200 毫秒" in html, "演示页显示模拟延迟提示")
+        os.environ["DEMO_SOLVE_DELAY_MS"] = "not-a-number"
+        html = client.get("/demo").get_data(as_text=True)
+        check("毫秒" not in html, "非法延迟值按 0 处理")
+    finally:
+        if old is None:
+            os.environ.pop("DEMO_SOLVE_DELAY_MS", None)
+        else:
+            os.environ["DEMO_SOLVE_DELAY_MS"] = old
+
+
 def main():
     app.config["TESTING"] = True
     CASES.clear()
@@ -205,6 +240,7 @@ def main():
         test_upload_validation(client)
         test_solve_flow_and_recompute(client)
         test_no_usable_light(client)
+        test_demo_delay_is_opt_in_and_demo_only(client)
     print("\nWeb 层全部自测通过。")
 
 
